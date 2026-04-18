@@ -185,15 +185,6 @@ function ManpowerTab({ state, navigate }) {
     return map;
   }, [topLocations]);
 
-  const pieOptions = useMemo(() => ({
-    responsive: true, maintainAspectRatio: false,
-    plugins: {
-      legend: { position: "bottom", labels: { color: "rgba(226,232,240,0.9)", boxWidth: 12 } },
-      tooltip: { enabled: true },
-      datalabels: { display: false },
-    },
-  }), []);
-
   /** Location pie: % of total hours per slice (matches list metric) */
   const locationPieOptions = useMemo(() => ({
     responsive: true,
@@ -2919,7 +2910,6 @@ function EquipmentTrackingTab() {
                                 {Object.entries(eq.hours_by_status)
                                   .sort((a, b) => b[1] - a[1])
                                   .map(([st, hrs]) => {
-                                    const meta = EQ_STATUS_META[st] || EQ_STATUS_META["Unknown"];
                                     const cnt = eq.count_by_status[st] || 0;
                                     return (
                                       <div key={st} className="flex items-center justify-between gap-2">
