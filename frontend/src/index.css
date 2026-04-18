@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Mobile & cross-browser baseline (Chrome, Safari iOS, Samsung Internet, Firefox) ── */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+  /* Side safe areas (notched devices) */
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Faster tap response; avoids double-tap zoom on controls in many mobile browsers */
+@layer base {
+  button,
+  [role="button"],
+  a[href] {
+    touch-action: manipulation;
+  }
+}
+
+/* Full-page photo backgrounds: `fixed` is janky on iOS Safari; scroll on narrow viewports */
+@media (max-width: 1023px) {
+  .mobile-bg-attachment-scroll {
+    background-attachment: scroll !important;
+  }
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}

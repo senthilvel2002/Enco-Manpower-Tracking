@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  html, body, #root {
+    @apply min-h-screen bg-slate-950 text-slate-100 font-sans;
+  }
+  input[type="date"]::-webkit-calendar-picker-indicator,
+  input[type="time"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.7);
+    cursor: pointer;
+  }
+  select option {
+    @apply bg-slate-900 text-slate-100;
+  }
+}
+
+@layer utilities {
+  .no-underline { text-decoration: none; }
+  .scrollbar-thin::-webkit-scrollbar { width: 4px; height: 4px; }
+  .scrollbar-thin::-webkit-scrollbar-track { @apply bg-slate-900; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { @apply rounded-full bg-slate-700; }
+}

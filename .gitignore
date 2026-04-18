@@ -1,0 +1,17 @@
+# Backend secrets and local config
+backend/.env
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,19 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: New → Blueprint → connect repo → apply this file.
+# Requires MongoDB Atlas (free) — set MONGODB_URI in the dashboard or here.
+
+services:
+  - type: web
+    name: enco-manpower
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: MONGODB_DB_NAME
+        value: enco_manpower
+      - key: MONGODB_URI
+        sync: false
