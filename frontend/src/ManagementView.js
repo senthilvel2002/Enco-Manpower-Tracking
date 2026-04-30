@@ -259,9 +259,10 @@ function ManpowerTab({ state, navigate }) {
     },
   }), []);
 
-  const mnpTrendData = mnpTrendView === "monthly"
-    ? (dashboard.monthly_trend || [])
-    : (dashboard.weekly_trend || []);
+  const mnpTrendData = useMemo(
+    () => (mnpTrendView === "monthly" ? (dashboard.monthly_trend || []) : (dashboard.weekly_trend || [])),
+    [mnpTrendView, dashboard.monthly_trend, dashboard.weekly_trend]
+  );
 
   const mnpTrendBarData = useMemo(() => ({
     labels: mnpTrendData.map((r) => mnpTrendView === "monthly" ? r.month : r.week),
