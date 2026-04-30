@@ -1,5 +1,6 @@
 import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import "./App.css";
+import RefreshRedirectsToHome from "./RefreshRedirectsToHome";
 import Home from "./Home";
 import WorkerLogin from "./WorkerLogin";
 import AdminLogin from "./AdminLogin";
@@ -16,6 +17,7 @@ import NotLoggedWorkersView from "./NotLoggedWorkersView";
 function App() {
   return (
     <Router>
+      <RefreshRedirectsToHome />
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/worker" element={<WorkerLogin />} />

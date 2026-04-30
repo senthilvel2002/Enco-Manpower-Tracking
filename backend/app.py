@@ -13,6 +13,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from config import Config
 from db import DatabaseUnavailable, get_database, ping_database
+from location_normalize import migrate_stored_location_aliases, normalize_work_location_name
 
 import re
 import base64
@@ -31,7 +32,7 @@ _cors_origins = [
     "http://127.0.0.1:3000",
     "http://192.168.8.188:3000",
 ]
-_extra_cors = (os.getenv("CORS_ORIGINS") or "").strip()
+_extra_cors = Config.CORS_ORIGINS
 if _extra_cors:
     for part in _extra_cors.split(","):
         p = part.strip()
@@ -58,8 +59,8 @@ MANAGEMENT_ALLOWED_CIVIL_IDS = {
     "140696356",
     "141246094",
 }
-SITE_INCHARGE_LOGIN_PASSWORD = "0000"
-MANAGEMENT_LOGIN_PASSWORD = "25017"
+SITE_INCHARGE_LOGIN_PASSWORD = Config.SITE_INCHARGE_LOGIN_PASSWORD
+MANAGEMENT_LOGIN_PASSWORD = Config.MANAGEMENT_LOGIN_PASSWORD
 INDIRECT_LABOUR_DESIGNATIONS = {
     "project manager",
     "site manager",
@@ -581,6 +582,8 @@ def init_db():
         db.locations.create_index([("name", 1)], unique=True)
         db.incharge.create_index([("name", 1)], unique=True)
         db.permit_issuer.create_index([("name", 1)], unique=True)
+
+        migrate_stored_location_aliases(db)
 
         # Daily fields belong on work_entries only; strip legacy keys from worker_details.
         db.worker_details.update_many(
@@ -1311,11 +1314,100 @@ def management_dashboard():
         db.work_entries.aggregate(
             [
                 {"$match": query},
-                {"$group": {"_id": "$incharge", "count": {"$sum": 1}}},
+                {"$group": {
+                    "_id": "$incharge",
+                    "count": {"$sum": 1},
+                    "total_hours": {"$sum": {"$ifNull": ["$hours", {"$ifNull": ["$worker_hours", 0]}]}},
+                }},
                 {"$sort": {"count": -1}},
             ]
         )
     )
+
+    by_company = list(
+        db.work_entries.aggregate(
+            [
+                {"$match": query},
+                {"$group": {
+                    "_id": "$company_name",
+                    "count": {"$sum": 1},
+                    "total_hours": {"$sum": {"$ifNull": ["$hours", {"$ifNull": ["$worker_hours", 0]}]}},
+                }},
+                {"$sort": {"count": -1}},
+            ]
+        )
+    )
+
+    by_category = list(
+        db.work_entries.aggregate(
+            [
+                {"$match": query},
+                {"$group": {
+                    "_id": "$category",
+                    "count": {"$sum": 1},
+                    "total_hours": {"$sum": {"$ifNull": ["$hours", {"$ifNull": ["$worker_hours", 0]}]}},
+                }},
+                {"$sort": {"count": -1}},
+            ]
+        )
+    )
+
+    # ── Weekly trend (last 8 weeks) ──
+    week_start = anchor - timedelta(days=anchor.weekday())
+    weekly_trend = []
+    for i in range(7, -1, -1):
+        ws = week_start - timedelta(weeks=i)
+        we = ws + timedelta(days=6)
+        label = f"W{ws.isocalendar()[1]} ({ws.strftime('%d %b')})"
+        base_query = {k: v for k, v in query.items() if k != "work_date"}
+        agg = list(db.work_entries.aggregate([
+            {"$match": {**base_query, "work_date": {"$gte": ws.isoformat(), "$lte": we.isoformat()}}},
+            {"$group": {
+                "_id": None,
+                "entries": {"$sum": 1},
+                "total_hours": {"$sum": {"$ifNull": ["$hours", {"$ifNull": ["$worker_hours", 0]}]}},
+                "direct": {"$sum": {"$cond": [{"$eq": ["$category", "Direct"]}, 1, 0]}},
+                "indirect": {"$sum": {"$cond": [{"$eq": ["$category", "Indirect"]}, 1, 0]}},
+            }},
+        ]))
+        row = agg[0] if agg else {}
+        weekly_trend.append({
+            "week": label,
+            "week_start": ws.isoformat(),
+            "entries": row.get("entries", 0),
+            "total_hours": round(row.get("total_hours") or 0, 2),
+            "direct": row.get("direct", 0),
+            "indirect": row.get("indirect", 0),
+        })
+
+    # ── Monthly trend (last 6 months) ──
+    monthly_trend = []
+    for i in range(5, -1, -1):
+        mo = (anchor.month - i - 1) % 12 + 1
+        yr = anchor.year + ((anchor.month - i - 1) // 12)
+        ms = date(yr, mo, 1)
+        next_mo = date(yr + (mo // 12), mo % 12 + 1, 1) if mo < 12 else date(yr + 1, 1, 1)
+        me = next_mo - timedelta(days=1)
+        base_query = {k: v for k, v in query.items() if k != "work_date"}
+        agg = list(db.work_entries.aggregate([
+            {"$match": {**base_query, "work_date": {"$gte": ms.isoformat(), "$lte": me.isoformat()}}},
+            {"$group": {
+                "_id": None,
+                "entries": {"$sum": 1},
+                "total_hours": {"$sum": {"$ifNull": ["$hours", {"$ifNull": ["$worker_hours", 0]}]}},
+                "direct": {"$sum": {"$cond": [{"$eq": ["$category", "Direct"]}, 1, 0]}},
+                "indirect": {"$sum": {"$cond": [{"$eq": ["$category", "Indirect"]}, 1, 0]}},
+            }},
+        ]))
+        row = agg[0] if agg else {}
+        monthly_trend.append({
+            "month": ms.strftime("%b %Y"),
+            "month_start": ms.isoformat(),
+            "entries": row.get("entries", 0),
+            "total_hours": round(row.get("total_hours") or 0, 2),
+            "direct": row.get("direct", 0),
+            "indirect": row.get("indirect", 0),
+        })
 
     recent_entries = [
         _serialize_doc(item)
@@ -1390,8 +1482,28 @@ def management_dashboard():
                 "summary_date": day_date,
             },
             "site_incharge_view": [
-                {"name": item.get("_id") or "N/A", "entries": item.get("count", 0)}
+                {
+                    "name": item.get("_id") or "N/A",
+                    "entries": item.get("count", 0),
+                    "total_hours": round(item.get("total_hours") or 0, 2),
+                }
                 for item in by_incharge
+            ],
+            "by_company": [
+                {
+                    "name": item.get("_id") or "N/A",
+                    "entries": item.get("count", 0),
+                    "total_hours": round(item.get("total_hours") or 0, 2),
+                }
+                for item in by_company
+            ],
+            "by_category": [
+                {
+                    "name": item.get("_id") or "Direct",
+                    "entries": item.get("count", 0),
+                    "total_hours": round(item.get("total_hours") or 0, 2),
+                }
+                for item in by_category
             ],
             "location_analytics": [
                 {
@@ -1401,6 +1513,8 @@ def management_dashboard():
                 }
                 for item in by_location
             ],
+            "weekly_trend": weekly_trend,
+            "monthly_trend": monthly_trend,
             "recent_entries": recent_entries,
         }
     )
@@ -1826,7 +1940,7 @@ def create_work_entry():
     company_name = (payload.get("company_name") or "").strip()
     worker_name = (payload.get("worker_name") or "").strip()
     work_date = date.today().isoformat()
-    location = (payload.get("location") or "").strip()
+    location = normalize_work_location_name((payload.get("location") or "").strip())
     incharge = (payload.get("incharge") or "").strip()
     permit_issuer = (payload.get("permit_issuer") or "").strip()
     today_activity = (payload.get("today_activity") or "").strip()
@@ -1976,6 +2090,225 @@ def create_work_entry():
     return jsonify({"ok": True, "id": str(result.inserted_id)})
 
 
+@app.post("/api/management/work-entries/import-excel")
+def management_import_excel():
+    """Bulk import work entries from .xlsx. Requires management_password.
+
+    format (form field):
+      - default / flat: civil_id columns — row 1 = headers (see excel_import_worker_entries.COLUMN_ALIASES)
+      - mnp: Enco MNP tracking workbook (Date, Company, Name Surname, Man/Equ, Area, …) — see excel_import_mnp_tracking
+    """
+    pw = (request.form.get("management_password") or "").strip()
+    if not pw:
+        body = request.get_json(silent=True) or {}
+        pw = (body.get("management_password") or "").strip()
+    ok, err = _ensure_management_password({"management_password": pw})
+    if not ok:
+        return err, 401
+
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "file is required (multipart field name: file)"}), 400
+    upload = request.files["file"]
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "empty file"}), 400
+    content = upload.read()
+    if not content:
+        return jsonify({"ok": False, "error": "empty file body"}), 400
+
+    fmt = (request.form.get("format") or "").strip().lower()
+    dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes")
+    db = get_database()
+
+    if fmt in ("mnp", "mnp-tracking", "mnp_tracking"):
+        from excel_import_mnp_tracking import import_mnp_tracking_excel
+
+        all_sheets = (request.form.get("all_sheets") or "").lower() in ("1", "true", "yes")
+        sheet_name = (request.form.get("sheet_name") or "").strip() or None
+        try:
+            sheet_index = int(request.form.get("sheet_index", "") or -1)
+        except ValueError:
+            sheet_index = -1
+        if sheet_index < 0:
+            sheet_index = None
+        create_missing_workers = (request.form.get("create_missing_workers") or "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        placeholder_for_no_civil_id = (request.form.get("placeholder_for_no_civil_id") or "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        import_equipment = (request.form.get("import_equipment") or "1").lower() not in ("0", "false", "no")
+        equipment_operator_civil_id = (request.form.get("equipment_operator_civil_id") or "").strip() or None
+
+        result = import_mnp_tracking_excel(
+            db,
+            content,
+            sheet_name=sheet_name,
+            sheet_index=sheet_index,
+            all_sheets=all_sheets,
+            dry_run=dry_run,
+            create_missing_workers=create_missing_workers,
+            placeholder_for_no_civil_id=placeholder_for_no_civil_id,
+            import_equipment=import_equipment,
+            equipment_operator_civil_id=equipment_operator_civil_id,
+        )
+        return jsonify(result)
+
+    from excel_import_worker_entries import import_excel_rows
+
+    try:
+        sheet_index = int(request.form.get("sheet_index", "0") or 0)
+    except ValueError:
+        sheet_index = 0
+    result = import_excel_rows(db, content, sheet_index=sheet_index, dry_run=dry_run)
+    return jsonify(result)
+
+
+@app.post("/api/management/work-entries/import-excel/stream")
+def management_import_excel_stream():
+    """SSE streaming variant of the MNP import.
+
+    Returns text/event-stream with JSON data lines so the browser can display
+    live progress.  Each event is one of:
+      {"type": "progress", "msg": "…"}
+      {"type": "done",     …result fields…}
+      {"type": "error",    "error": "…"}
+    """
+    import json as _json
+    import queue as _queue
+    import threading as _threading
+    from flask import Response, stream_with_context
+
+    pw = (request.form.get("management_password") or "").strip()
+    ok, err = _ensure_management_password({"management_password": pw})
+    if not ok:
+        return err, 401
+
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "file is required"}), 400
+    upload = request.files["file"]
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "empty file"}), 400
+    content = upload.read()
+    if not content:
+        return jsonify({"ok": False, "error": "empty file body"}), 400
+
+    fmt = (request.form.get("format") or "").strip().lower()
+    dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes")
+    all_sheets = (request.form.get("all_sheets") or "").lower() in ("1", "true", "yes")
+    sheet_name = (request.form.get("sheet_name") or "").strip() or None
+    try:
+        sheet_index = int(request.form.get("sheet_index", "") or -1)
+    except ValueError:
+        sheet_index = -1
+    if sheet_index < 0:
+        sheet_index = None
+    create_missing_workers = (request.form.get("create_missing_workers") or "").lower() in ("1", "true", "yes")
+    placeholder_for_no_civil_id = (request.form.get("placeholder_for_no_civil_id") or "").lower() in ("1", "true", "yes")
+    import_equipment = (request.form.get("import_equipment") or "1").lower() not in ("0", "false", "no")
+    equipment_operator_civil_id = (request.form.get("equipment_operator_civil_id") or "").strip() or None
+
+    db = get_database()
+    q: _queue.Queue = _queue.Queue()
+
+    def _run_import():
+        from excel_import_progress import clear_progress_callback, set_progress_callback
+        from excel_import_mnp_tracking import import_mnp_tracking_excel
+
+        def _cb(msg: str):
+            q.put(("progress", msg))
+
+        set_progress_callback(_cb)
+        try:
+            result = import_mnp_tracking_excel(
+                db,
+                content,
+                sheet_name=sheet_name,
+                sheet_index=sheet_index,
+                all_sheets=all_sheets,
+                dry_run=dry_run,
+                create_missing_workers=create_missing_workers,
+                placeholder_for_no_civil_id=placeholder_for_no_civil_id,
+                import_equipment=import_equipment,
+                equipment_operator_civil_id=equipment_operator_civil_id,
+                progress=True,
+            )
+            q.put(("done", result))
+        except Exception as exc:
+            q.put(("error", str(exc)))
+        finally:
+            clear_progress_callback()
+
+    t = _threading.Thread(target=_run_import, daemon=True)
+    t.start()
+
+    def _generate():
+        while True:
+            kind, data = q.get()
+            if kind == "progress":
+                yield "data: " + _json.dumps({"type": "progress", "msg": data}) + "\n\n"
+            elif kind == "done":
+                yield "data: " + _json.dumps({"type": "done", **data}) + "\n\n"
+                break
+            elif kind == "error":
+                yield "data: " + _json.dumps({"type": "error", "error": data}) + "\n\n"
+                break
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/management/equipment-entries/import-excel")
+def management_import_equipment_excel():
+    """Bulk import equipment entries from .xlsx (management only)."""
+    pw = (request.form.get("management_password") or "").strip()
+    if not pw:
+        body = request.get_json(silent=True) or {}
+        pw = (body.get("management_password") or "").strip()
+    ok, err = _ensure_management_password({"management_password": pw})
+    if not ok:
+        return err, 401
+
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "file is required (multipart field name: file)"}), 400
+    upload = request.files["file"]
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "empty file"}), 400
+    content = upload.read()
+    if not content:
+        return jsonify({"ok": False, "error": "empty file body"}), 400
+
+    try:
+        sheet_index = int(request.form.get("sheet_index", "0") or 0)
+    except ValueError:
+        sheet_index = 0
+    sheet_name = (request.form.get("sheet_name") or "").strip() or None
+    dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes")
+    operator_civil_id = (request.form.get("operator_civil_id") or "").strip() or DEVELOPER_MASTER_CIVIL_ID
+
+    from excel_import_equipment_entries import import_equipment_excel_rows
+
+    db = get_database()
+    result = import_equipment_excel_rows(
+        db,
+        content,
+        sheet_index=sheet_index,
+        sheet_name=sheet_name,
+        dry_run=dry_run,
+        default_operator_civil_id=operator_civil_id,
+    )
+    return jsonify(result)
+
+
 @app.get("/api/work-entries/today-status")
 def work_entry_today_status():
     """Check whether a worker already has an entry for today."""
@@ -2026,7 +2359,7 @@ def update_work_entry(entry_id):
         if hours_value < 0 or hours_value > 24:
             return jsonify({"ok": False, "error": "hours must be between 0 and 24"}), 400
 
-    location_value = (payload.get("location", existing.get("location")) or "").strip() or None
+    location_value = normalize_work_location_name((payload.get("location", existing.get("location")) or "").strip()) or None
     incharge_value = (payload.get("incharge", existing.get("incharge")) or "").strip() or None
     today_activity_value = (payload.get("today_activity", existing.get("today_activity")) or "").strip()
     work_date_value = (payload.get("work_date", existing.get("work_date")) or "").strip()
@@ -2196,7 +2529,7 @@ def management_create_equipment():
     name = (payload.get("name") or "").strip()
     plate_number = (payload.get("plate_number") or "").strip()
     equipment_type = (payload.get("equipment_type") or "").strip()
-    location = (payload.get("location") or "").strip()
+    location = normalize_work_location_name((payload.get("location") or "").strip())
     ownership_raw = (payload.get("ownership") or "owned").strip().lower()
 
     if not name or not equipment_type or not location:
@@ -2468,7 +2801,7 @@ def management_update_equipment(equipment_id):
     name = (payload.get("name", existing.get("name")) or "").strip()
     plate_number = (payload.get("plate_number", existing.get("plate_number")) or "").strip()
     equipment_type = (payload.get("equipment_type", existing.get("equipment_type")) or "").strip()
-    location = (payload.get("location", existing.get("location")) or "").strip()
+    location = normalize_work_location_name((payload.get("location", existing.get("location")) or "").strip())
     ownership_raw = (payload.get("ownership", existing.get("ownership")) or "owned").strip().lower()
     is_active_raw = payload.get("is_active", existing.get("is_active", True))
 
@@ -2812,7 +3145,10 @@ def update_equipment_entry(entry_id):
 
     for field in ["work_date", "location", "activity", "operator_name", "time_from", "time_to", "equipment_status"]:
         if field in payload:
-            update_fields[field] = (payload[field] or "").strip() or None
+            val = (payload[field] or "").strip() or None
+            if field == "location" and val:
+                val = normalize_work_location_name(val) or None
+            update_fields[field] = val
 
     if "hours" in payload:
         try:
@@ -2930,6 +3266,87 @@ def _build_equipment_export_workbook(entries):
     return buf
 
 
+def _build_equipment_master_export_workbook(equipment_docs):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Equipment Master"
+
+    headers = [
+        "S.I No",
+        "Equipment Name",
+        "Plate / Serial",
+        "Type",
+        "Location",
+        "Ownership",
+        "Status",
+        "Supply Rate/mo (OMR)",
+        "Contract/hr",
+        "Contract/day",
+        "Contract/wk",
+        "Contract/mo",
+    ]
+    ws.append(headers)
+
+    hdr_font = Font(bold=True, color="000000")
+    hdr_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+    center = Alignment(horizontal="center", vertical="center")
+    thin = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    for col in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = center
+        cell.border = thin
+
+    for idx, eq in enumerate(equipment_docs, start=1):
+        sr = eq.get("supply_rate") or {}
+        cr = eq.get("contract_rate") or {}
+        is_rental = eq.get("ownership") == "rental"
+        supply_mo = ""
+        if is_rental and sr.get("monthly") not in (None, 0, ""):
+            supply_mo = sr.get("monthly")
+
+        def cr_cell(key):
+            v = cr.get(key)
+            return v if v not in (None, 0, "") else ""
+
+        ws.append([
+            idx,
+            eq.get("name", ""),
+            eq.get("plate_number", ""),
+            eq.get("equipment_type", ""),
+            eq.get("location", ""),
+            "ENCO Owned" if eq.get("ownership") == "owned" else "Rental",
+            "Active" if eq.get("is_active") is not False else "Inactive",
+            supply_mo,
+            cr_cell("hourly"),
+            cr_cell("daily"),
+            cr_cell("weekly"),
+            cr_cell("monthly"),
+        ])
+
+    max_row = ws.max_row
+    for r in range(2, max_row + 1):
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = center
+            cell.border = thin
+
+    col_widths = [6, 28, 16, 14, 22, 14, 10, 18, 12, 12, 12, 12]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 @app.get("/api/management/export-equipment-excel")
 def export_equipment_excel():
     db = get_database()
@@ -2982,6 +3399,44 @@ def export_equipment_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name=f"equipment_entries_{anchor.isoformat()}.xlsx",
+    )
+
+
+@app.get("/api/management/export-equipment-master-excel")
+def export_equipment_master_excel():
+    """Export equipment master list (same filters as dashboard master list + optional search)."""
+    db = get_database()
+    location = (request.args.get("location") or "").strip()
+    eq_type = (request.args.get("type") or "").strip()
+    search = (request.args.get("search") or "").strip().lower()
+
+    eq_filter = {"is_active": True}
+    if eq_type and eq_type != "all":
+        eq_filter["equipment_type"] = eq_type
+    if location and location != "all":
+        eq_filter["location"] = location
+
+    equipment = list(
+        db.equipment_details.find(eq_filter).sort([("equipment_type", 1), ("name", 1)])
+    )
+
+    if search:
+        def matches(doc):
+            return (
+                search in (doc.get("name") or "").lower()
+                or search in (doc.get("plate_number") or "").lower()
+                or search in (doc.get("equipment_type") or "").lower()
+                or search in (doc.get("location") or "").lower()
+            )
+
+        equipment = [e for e in equipment if matches(e)]
+
+    buf = _build_equipment_master_export_workbook(equipment)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"equipment_master_{date.today().isoformat()}.xlsx",
     )
 
 
@@ -3165,7 +3620,7 @@ def create_equipment_entry():
     work_date = (payload.get("work_date") or date.today().isoformat()).strip()
     time_from = (payload.get("time_from") or "").strip()
     time_to = (payload.get("time_to") or "").strip()
-    location = (payload.get("location") or "").strip()
+    location = normalize_work_location_name((payload.get("location") or "").strip())
     activity = (payload.get("activity") or "").strip()
     equipment_status = (payload.get("equipment_status") or "").strip()
     rental_amount = payload.get("rental_amount")

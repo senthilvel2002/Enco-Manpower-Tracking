@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { apiUrl } from "./api";
 import { Pie, Bar, Line } from "react-chartjs-2";
@@ -140,10 +140,16 @@ function ManpowerTab({ state, navigate }) {
   const [anchorDate, setAnchorDate] = useState(new Date().toISOString().slice(0, 10));
   const [filteredByLocation, setFilteredByLocation] = useState([]);
   const [dashboard, setDashboard] = useState({
-    summary: { total_workers: 0, logged_workers: 0, not_logged_workers: 0, direct_workers: 0, indirect_workers: 0, direct_logged: 0, indirect_logged: 0, summary_date: "" },
+    summary: { total_workers: 0, logged_workers: 0, not_logged_workers: 0, direct_workers: 0, indirect_workers: 0, direct_logged: 0, indirect_logged: 0, summary_date: "", total_entries: 0, today_entries: 0 },
     location_analytics: [],
+    site_incharge_view: [],
+    by_company: [],
+    by_category: [],
+    weekly_trend: [],
+    monthly_trend: [],
     recent_entries: [],
   });
+  const [mnpTrendView, setMnpTrendView] = useState("monthly");
   const [editingEntry, setEditingEntry] = useState(null);
   const [entryForm, setEntryForm] = useState({
     work_date: "",
@@ -157,6 +163,17 @@ function ManpowerTab({ state, navigate }) {
   });
   const [expandedShiftId, setExpandedShiftId] = useState(null);
   const [pendingCount, setPendingCount] = useState(0);
+  const [mnpImportOpen, setMnpImportOpen] = useState(false);
+  const [mnpSheetName, setMnpSheetName] = useState("");
+  const [mnpCreateWorkers, setMnpCreateWorkers] = useState(true);
+  const [mnpPlaceholderNoCivil, setMnpPlaceholderNoCivil] = useState(true);
+  const [mnpImportEquipment, setMnpImportEquipment] = useState(true);
+  const [mnpEquipOpCivil, setMnpEquipOpCivil] = useState("");
+  const [mnpImportResult, setMnpImportResult] = useState(null);
+  const [mnpImporting, setMnpImporting] = useState(false);
+  const [mnpProgressLog, setMnpProgressLog] = useState([]);
+  const mnpProgressEndRef = useRef(null);
+  const mnpFileRef = useRef(null);
 
   const runWithLoading = useCallback(async (fn) => {
     setPendingCount((c) => c + 1);
@@ -239,6 +256,46 @@ function ManpowerTab({ state, navigate }) {
           return Math.round((value / total) * 100) + "%";
         },
       },
+    },
+  }), []);
+
+  const mnpTrendData = mnpTrendView === "monthly"
+    ? (dashboard.monthly_trend || [])
+    : (dashboard.weekly_trend || []);
+
+  const mnpTrendBarData = useMemo(() => ({
+    labels: mnpTrendData.map((r) => mnpTrendView === "monthly" ? r.month : r.week),
+    datasets: [
+      {
+        label: "Total Hours",
+        data: mnpTrendData.map((r) => r.total_hours),
+        backgroundColor: "rgba(56,189,248,0.65)",
+        borderColor: "rgba(56,189,248,0.9)",
+        borderWidth: 1,
+        borderRadius: 4,
+      },
+      {
+        label: "Entries",
+        data: mnpTrendData.map((r) => r.entries),
+        backgroundColor: "rgba(168,85,247,0.45)",
+        borderColor: "rgba(168,85,247,0.8)",
+        borderWidth: 1,
+        borderRadius: 4,
+      },
+    ],
+  }), [mnpTrendData, mnpTrendView]);
+
+  const mnpTrendBarOptions = useMemo(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: "top", labels: { color: "rgba(226,232,240,0.85)", boxWidth: 12, font: { size: 11 } } },
+      datalabels: { display: false },
+      tooltip: { enabled: true },
+    },
+    scales: {
+      x: { ticks: { color: "rgba(148,163,184,0.85)", font: { size: 10 } }, grid: { color: "rgba(255,255,255,0.04)" } },
+      y: { ticks: { color: "rgba(148,163,184,0.85)", font: { size: 10 } }, grid: { color: "rgba(255,255,255,0.06)" } },
     },
   }), []);
 
@@ -412,6 +469,81 @@ function ManpowerTab({ state, navigate }) {
     } catch { alert("Unable to delete now"); }
   };
 
+  const submitMnpImport = async () => {
+    const file = mnpFileRef.current?.files?.[0];
+    if (!file) { alert("Choose an .xlsx file first."); return; }
+    const auth = await promptManagementPassword("import MNP Excel workbook");
+    if (auth.cancelled) return;
+    if (auth.error) { alert(auth.error); return; }
+
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("format", "mnp");
+    fd.append("management_password", auth.password);
+    if (mnpSheetName.trim()) fd.append("sheet_name", mnpSheetName.trim());
+    if (mnpCreateWorkers) fd.append("create_missing_workers", "true");
+    if (mnpPlaceholderNoCivil) fd.append("placeholder_for_no_civil_id", "true");
+    if (!mnpImportEquipment) fd.append("import_equipment", "false");
+    if (mnpEquipOpCivil.trim()) fd.append("equipment_operator_civil_id", mnpEquipOpCivil.trim());
+
+    setMnpImportResult(null);
+    setMnpProgressLog([]);
+    setMnpImporting(true);
+
+    try {
+      const res = await fetch(apiUrl("/api/management/work-entries/import-excel/stream"), {
+        method: "POST",
+        body: fd,
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        alert(errData?.error || `Server error ${res.status}`);
+        setMnpImporting(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by double newline
+        const events = buf.split("\n\n");
+        buf = events.pop(); // keep any incomplete chunk
+
+        for (const ev of events) {
+          const line = ev.trim();
+          if (!line.startsWith("data: ")) continue;
+          let data;
+          try { data = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (data.type === "progress") {
+            setMnpProgressLog((prev) => [...prev, data.msg]);
+            // auto-scroll
+            setTimeout(() => mnpProgressEndRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
+          } else if (data.type === "done") {
+            setMnpImportResult(data);
+            setMnpImporting(false);
+            await loadDashboard();
+            if (mnpFileRef.current) mnpFileRef.current.value = "";
+          } else if (data.type === "error") {
+            alert("Import error: " + data.error);
+            setMnpImporting(false);
+          }
+        }
+      }
+    } catch (e) {
+      alert("Import failed: " + (e?.message || e));
+    } finally {
+      setMnpImporting(false);
+    }
+  };
+
   const getApprovalState = (entry) => {
     const s = (entry?.approval_status || "").toLowerCase();
     if (s === "approved") return "approved";
@@ -445,7 +577,162 @@ function ManpowerTab({ state, navigate }) {
           className="rounded-xl border border-sky-400/30 hover:border-sky-400/60 text-sky-300 hover:text-sky-100 text-xs font-bold px-3 py-2 transition">
           ✉ Email
         </button>
+        <button
+          type="button"
+          onClick={() => { setMnpImportOpen((v) => !v); setMnpImportResult(null); setMnpProgressLog([]); }}
+          className="rounded-xl border border-violet-400/35 hover:border-violet-400/65 text-violet-200 text-xs font-bold px-3 py-2 transition"
+        >
+          ↑ Import Previous Month Excel
+        </button>
       </div>
+
+      {mnpImportOpen && (
+        <CardPanel className="p-5 border-violet-400/20 bg-violet-950/20">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-bold text-white">Import Previous Month (MNP Tracking Excel)</div>
+            <button type="button" disabled={mnpImporting}
+              onClick={() => { setMnpImportOpen(false); setMnpImportResult(null); setMnpProgressLog([]); }}
+              className="text-slate-400 hover:text-slate-200 disabled:opacity-40 text-xs font-bold px-2 py-1 rounded transition">✕ Close</button>
+          </div>
+          <p className="text-xs text-slate-400 mb-4 leading-relaxed">
+            Upload the monthly MNP tracking workbook (e.g. <span className="text-slate-200">25-EG-OM-017-Mnp Tracking-March 2026.xlsx</span>).
+            Columns: Date, Company, Name Surname, Civil ID, Man/Equ, Area, Manhours, activities.
+            <br />
+            <span className="text-emerald-300">Manpower / Sub Contractor</span> rows → <strong>Worker Entries</strong> (matched by Civil ID).{" "}
+            <span className="text-sky-300">Equipment</span> rows → <strong>Equipment Entries</strong> (matched by name + location in master data).
+          </p>
+
+          {/* File + sheet row */}
+          <div className="flex flex-wrap gap-3 items-end mb-4">
+            <div>
+              <div className={labelCls}>Excel File (.xlsx)</div>
+              <input ref={mnpFileRef} type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                className="text-xs text-slate-300 max-w-full file:mr-2 file:rounded-lg file:border-0 file:bg-violet-600 file:px-3 file:py-1.5 file:text-xs file:font-bold file:text-white hover:file:bg-violet-500 cursor-pointer" />
+            </div>
+            <FormField label="Sheet Name (leave blank = auto-detect)">
+              <input type="text" className={`${inputCls} w-48`} placeholder="e.g. March 2026"
+                value={mnpSheetName} onChange={(e) => setMnpSheetName(e.target.value)} />
+            </FormField>
+          </div>
+
+          {/* Options */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-4 text-xs text-slate-300">
+            <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-white/8 transition">
+              <input type="checkbox" checked={mnpCreateWorkers}
+                onChange={(e) => setMnpCreateWorkers(e.target.checked)} className="rounded border-white/20 accent-violet-400" />
+              <div>
+                <div className="font-semibold text-slate-200">Create missing workers</div>
+                <div className="text-slate-500 text-[11px]">Civil ID in file but not in DB — adds to worker profiles (company must exist in master data)</div>
+              </div>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-white/8 transition">
+              <input type="checkbox" checked={mnpPlaceholderNoCivil}
+                onChange={(e) => setMnpPlaceholderNoCivil(e.target.checked)} className="rounded border-white/20 accent-amber-400" />
+              <div>
+                <div className="font-semibold text-amber-300">Use "0000" for missing Civil IDs</div>
+                <div className="text-slate-500 text-[11px]">Rows with no Civil ID in Excel are stored with civil_id = 0000 — update later once IDs are known</div>
+              </div>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-white/8 transition">
+              <input type="checkbox" checked={mnpImportEquipment}
+                onChange={(e) => setMnpImportEquipment(e.target.checked)} className="rounded border-white/20 accent-sky-400" />
+              <div>
+                <div className="font-semibold text-slate-200">Import equipment rows</div>
+                <div className="text-slate-500 text-[11px]">Man/Equ = Equipment rows → equipment entries (equipment must be registered in master data)</div>
+              </div>
+            </label>
+            <FormField label="Equipment operator Civil ID (optional)">
+              <input type="text" className={`${inputCls} w-full`} placeholder="Defaults to system operator ID"
+                value={mnpEquipOpCivil} onChange={(e) => setMnpEquipOpCivil(e.target.value)} />
+            </FormField>
+          </div>
+
+          <button type="button" onClick={submitMnpImport} disabled={mnpImporting}
+            className="rounded-xl bg-violet-600 hover:bg-violet-500 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold px-5 py-2.5 transition shadow-lg shadow-violet-900/40">
+            {mnpImporting ? "Importing…" : "Run Import"}
+          </button>
+
+          {/* Live progress log */}
+          {(mnpImporting || mnpProgressLog.length > 0) && !mnpImportResult && (
+            <div className="mt-4 rounded-xl border border-violet-400/20 bg-slate-900/70 overflow-hidden">
+              <div className="flex items-center gap-2 px-4 py-2.5 border-b border-white/8 bg-violet-950/40">
+                {mnpImporting && (
+                  <span className="inline-block w-3 h-3 rounded-full bg-violet-400 animate-pulse shrink-0" />
+                )}
+                <span className="text-xs font-bold text-violet-200">
+                  {mnpImporting ? "Import in progress…" : "Import log"}
+                </span>
+              </div>
+              <div className="max-h-52 overflow-y-auto p-3 space-y-0.5 font-mono text-[11px]">
+                {mnpProgressLog.map((msg, i) => {
+                  const isRow = /\/\d+\s*\(\d+%\)/.test(msg);
+                  const isHeader = msg.startsWith("[") || msg.includes("Sheet") || msg.includes("import");
+                  return (
+                    <div key={i} className={
+                      isRow ? "text-sky-300" :
+                      isHeader ? "text-violet-200 font-semibold mt-1" :
+                      "text-slate-400"
+                    }>
+                      {msg}
+                    </div>
+                  );
+                })}
+                <div ref={mnpProgressEndRef} />
+              </div>
+            </div>
+          )}
+
+          {/* Results panel */}
+          {mnpImportResult && (
+            <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/60 p-4">
+              <div className={`text-sm font-bold mb-3 ${mnpImportResult.ok ? "text-emerald-300" : "text-rose-300"}`}>
+                {mnpImportResult.ok ? "Import Complete" : "Import Error"}
+              </div>
+              {mnpImportResult.ok ? (
+                <>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+                    {[
+                      { label: "Worker Entries Added", value: mnpImportResult.inserted ?? 0, color: "text-emerald-300" },
+                      { label: "No-Civil-ID (0000)", value: mnpImportResult.placeholder_inserted ?? 0, color: "text-amber-300" },
+                      { label: "Equipment Entries", value: mnpImportResult.equipment_inserted ?? 0, color: "text-sky-300" },
+                      { label: "Workers Created", value: mnpImportResult.workers_created ?? 0, color: "text-violet-300" },
+                    ].map((s) => (
+                      <div key={s.label} className="rounded-lg bg-slate-800/70 border border-white/8 p-3 text-center">
+                        <div className={`text-xl font-black ${s.color}`}>{s.value}</div>
+                        <div className="text-[11px] text-slate-400 mt-0.5">{s.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="text-xs text-slate-400 mb-2">
+                    Total rows read: <span className="text-slate-200">{mnpImportResult.rows_read ?? "—"}</span>
+                    {" · "}Manpower rows: <span className="text-slate-200">{mnpImportResult.manpower_rows ?? "—"}</span>
+                    {" · "}Equipment rows: <span className="text-slate-200">{mnpImportResult.equipment_rows ?? "—"}</span>
+                    {" · "}Row errors: <span className={(mnpImportResult.row_errors?.length || 0) > 0 ? "text-rose-300 font-bold" : "text-slate-200"}>
+                      {mnpImportResult.row_errors?.length ?? 0}
+                    </span>
+                  </div>
+                  {(mnpImportResult.row_errors?.length || 0) > 0 && (
+                    <details className="mt-2">
+                      <summary className="text-xs font-semibold text-rose-300 cursor-pointer hover:text-rose-200">
+                        Show row errors ({mnpImportResult.row_errors.length})
+                      </summary>
+                      <div className="mt-2 max-h-40 overflow-y-auto rounded-lg bg-rose-950/30 border border-rose-400/20 p-2 space-y-1">
+                        {mnpImportResult.row_errors.map((e, i) => (
+                          <div key={i} className="text-[11px] text-rose-200 font-mono">
+                            Row {e.row}{e.civil_id ? ` [${e.civil_id}]` : ""}: {e.error}
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </>
+              ) : (
+                <div className="text-sm text-rose-200">{mnpImportResult.error}</div>
+              )}
+            </div>
+          )}
+        </CardPanel>
+      )}
 
       <div className="space-y-5">
         {/* Add New Worker Panel */}
@@ -661,9 +948,12 @@ function ManpowerTab({ state, navigate }) {
                     <span className="flex items-center gap-2 min-w-0">
                       <span className="w-2.5 h-2.5 rounded-full shrink-0"
                         style={{ backgroundColor: locationColorMap[item.name] || "rgba(148,163,184,0.65)" }} />
-                      <span className="text-sm text-slate-300 max-w-[130px] truncate" title={item.name}>{item.name}</span>
+                      <span className="text-sm text-slate-300 max-w-[110px] truncate" title={item.name}>{item.name}</span>
                     </span>
-                    <span className="text-sm font-bold text-sky-300 whitespace-nowrap">{Number(item.hours || 0).toFixed(1)} h</span>
+                    <div className="flex items-center gap-2 text-right">
+                      <span className="text-[10px] text-slate-500">{item.entries}x</span>
+                      <span className="text-sm font-bold text-sky-300 whitespace-nowrap">{Number(item.hours || 0).toFixed(1)} h</span>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -707,6 +997,108 @@ function ManpowerTab({ state, navigate }) {
                 No logged workers yet
               </div>
             )}
+          </CardPanel>
+
+        </div>
+
+        {/* ── Analytics Row: By Company + By Incharge + Trend (compact 3-col) ── */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+          {/* By Company */}
+          <CardPanel className="p-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-3">By Company</h3>
+            <div className="space-y-1 max-h-44 overflow-y-auto scrollbar-thin">
+              {(dashboard.by_company || []).length === 0 && (
+                <div className="text-xs text-slate-500">No data</div>
+              )}
+              {(dashboard.by_company || []).map((item) => {
+                const maxE = Math.max(...(dashboard.by_company || []).map((x) => x.entries), 1);
+                const barPct = Math.round((item.entries / maxE) * 100);
+                return (
+                  <div key={item.name} className="rounded-lg border border-white/8 bg-slate-900/50 px-2.5 py-1.5">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-slate-300 truncate max-w-[130px]" title={item.name}>{item.name}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-slate-500">{Number(item.total_hours || 0).toFixed(1)} h</span>
+                        <span className="text-xs font-bold text-amber-300">{item.entries}</span>
+                      </div>
+                    </div>
+                    <div className="w-full bg-slate-800 rounded-full h-1">
+                      <div className="h-1 rounded-full bg-amber-400/60 transition-all" style={{ width: `${barPct}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardPanel>
+
+          {/* By Site Incharge */}
+          <CardPanel className="p-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-3">By Site Incharge</h3>
+            <div className="space-y-1 max-h-44 overflow-y-auto scrollbar-thin">
+              {(dashboard.site_incharge_view || []).length === 0 && (
+                <div className="text-xs text-slate-500">No data</div>
+              )}
+              {(dashboard.site_incharge_view || []).map((item) => {
+                const maxE = Math.max(...(dashboard.site_incharge_view || []).map((x) => x.entries), 1);
+                const barPct = Math.round((item.entries / maxE) * 100);
+                return (
+                  <div key={item.name} className="rounded-lg border border-white/8 bg-slate-900/50 px-2.5 py-1.5">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-slate-300 truncate max-w-[130px]" title={item.name}>{item.name}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-slate-500">{Number(item.total_hours || 0).toFixed(1)} h</span>
+                        <span className="text-xs font-bold text-emerald-300">{item.entries}</span>
+                      </div>
+                    </div>
+                    <div className="w-full bg-slate-800 rounded-full h-1">
+                      <div className="h-1 rounded-full bg-emerald-400/60 transition-all" style={{ width: `${barPct}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardPanel>
+
+          {/* Manhours & Entries Trend */}
+          <CardPanel className="p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Hours Trend</h3>
+              <div className="flex gap-1">
+                {["monthly", "weekly"].map((v) => (
+                  <button key={v} type="button" onClick={() => setMnpTrendView(v)}
+                    className={`px-2 py-1 rounded text-[10px] font-bold transition ${
+                      mnpTrendView === v ? "bg-sky-500 text-white" : "border border-white/20 text-slate-400 hover:text-white"
+                    }`}>
+                    {v === "monthly" ? "Mo" : "Wk"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {mnpTrendData.some((r) => r.entries > 0) ? (
+              <div className="h-36">
+                <Bar data={mnpTrendBarData} options={mnpTrendBarOptions} />
+              </div>
+            ) : (
+              <div className="h-36 flex items-center justify-center text-xs text-slate-500">No trend data</div>
+            )}
+            <div className="mt-2 space-y-0.5 max-h-24 overflow-y-auto scrollbar-thin">
+              {mnpTrendData.map((row) => {
+                const key = mnpTrendView === "monthly" ? row.month : row.week;
+                const maxH = Math.max(...mnpTrendData.map((r) => r.total_hours), 1);
+                const barPct = Math.round((row.total_hours / maxH) * 100);
+                return (
+                  <div key={key} className="flex items-center gap-2 text-[10px]">
+                    <span className="text-slate-400 w-20 shrink-0 truncate">{key}</span>
+                    <div className="flex-1 bg-slate-800 rounded-full h-1">
+                      <div className="h-1 rounded-full bg-sky-400/70" style={{ width: `${barPct}%` }} />
+                    </div>
+                    <span className="text-sky-300 w-12 text-right shrink-0">{row.total_hours}h</span>
+                    <span className="text-slate-500 w-8 text-right shrink-0">{row.entries}</span>
+                  </div>
+                );
+              })}
+            </div>
           </CardPanel>
 
         </div>
@@ -910,6 +1302,7 @@ function EquipmentTab() {
   const [pendingCount, setPendingCount] = useState(0);
   const [showMasterList, setShowMasterList] = useState(false);
   const [showAddEquipment, setShowAddEquipment] = useState(false);
+  const [showEquipmentImport, setShowEquipmentImport] = useState(false);
   const [locations, setLocations] = useState([]);
   const [newEquipment, setNewEquipment] = useState({
     name: "",
@@ -925,6 +1318,12 @@ function EquipmentTab() {
   const [newEquipCropOpen, setNewEquipCropOpen] = useState(false);
   const [trendView, setTrendView] = useState("monthly"); // "weekly" | "monthly"
   const [masterSearch, setMasterSearch] = useState("");
+  const [equipmentImportSheetName, setEquipmentImportSheetName] = useState("");
+  const [equipmentImportDryRun, setEquipmentImportDryRun] = useState(false);
+  const [equipmentImportCivilId, setEquipmentImportCivilId] = useState("");
+  const [equipmentImportResult, setEquipmentImportResult] = useState(null);
+  const [equipmentImporting, setEquipmentImporting] = useState(false);
+  const equipmentImportFileRef = useRef(null);
 
   const runWithLoading = useCallback(async (fn) => {
     setPendingCount((c) => c + 1);
@@ -967,6 +1366,54 @@ function EquipmentTab() {
   const handleDownloadExcel = () => {
     const params = new URLSearchParams({ location: selectedLocation, type: selectedType, period: selectedPeriod, anchor_date: anchorDate });
     window.open(apiUrl(`/api/management/export-equipment-excel?${params}`), "_blank");
+  };
+
+  const handleDownloadMasterListExcel = () => {
+    const params = new URLSearchParams({
+      location: selectedLocation,
+      type: selectedType,
+      search: masterSearch.trim(),
+    });
+    window.open(apiUrl(`/api/management/export-equipment-master-excel?${params}`), "_blank");
+  };
+
+  const submitEquipmentImport = async () => {
+    const file = equipmentImportFileRef.current?.files?.[0];
+    if (!file) { alert("Choose an .xlsx file first."); return; }
+    const auth = await promptManagementPassword("import equipment Excel");
+    if (auth.cancelled) return;
+    if (auth.error) { alert(auth.error); return; }
+
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("management_password", auth.password);
+    if (equipmentImportSheetName.trim()) fd.append("sheet_name", equipmentImportSheetName.trim());
+    if (equipmentImportDryRun) fd.append("dry_run", "true");
+    if (equipmentImportCivilId.trim()) fd.append("operator_civil_id", equipmentImportCivilId.trim());
+
+    setEquipmentImportResult(null);
+    setEquipmentImporting(true);
+    try {
+      const res = await runWithLoading(() => fetch(apiUrl("/api/management/equipment-entries/import-excel"), {
+        method: "POST",
+        body: fd,
+      }));
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        alert(data?.error || "Unable to import equipment excel");
+        setEquipmentImporting(false);
+        return;
+      }
+      setEquipmentImportResult(data);
+      if (!equipmentImportDryRun) {
+        await loadDashboard();
+      }
+      if (equipmentImportFileRef.current) equipmentImportFileRef.current.value = "";
+    } catch (e) {
+      alert("Import failed: " + (e?.message || e));
+    } finally {
+      setEquipmentImporting(false);
+    }
   };
 
   const reloadTypes = async () => {
@@ -1252,12 +1699,121 @@ function EquipmentTab() {
           {showMasterList ? "Hide" : "📋"} Equipment List
         </button>
         <button type="button" onClick={handleDownloadExcel}
-          className="rounded-xl border border-amber-400/30 hover:border-amber-400/60 text-amber-300 hover:text-amber-100 text-xs font-bold px-3 py-2 transition">
-          ↓ Equipment Excel
+          className="rounded-xl border border-amber-400/30 hover:border-amber-400/60 text-amber-300 hover:text-amber-100 text-xs font-bold px-3 py-2 transition"
+          title="Download equipment time entries for the selected period and filters">
+          ↓ Entries (Excel)
+        </button>
+        <button
+          type="button"
+          onClick={() => { setShowEquipmentImport((v) => !v); setEquipmentImportResult(null); }}
+          className="rounded-xl border border-sky-400/35 hover:border-sky-400/65 text-sky-200 text-xs font-bold px-3 py-2 transition"
+        >
+          ↑ Import Equipment Excel
         </button>
       </div>
 
       <div className="space-y-5">
+        {showEquipmentImport && (
+          <CardPanel className="p-5 border-sky-400/20 bg-sky-950/20">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-bold text-white">Import Equipment Entries (Any Month)</div>
+              <button
+                type="button"
+                disabled={equipmentImporting}
+                onClick={() => { setShowEquipmentImport(false); setEquipmentImportResult(null); }}
+                className="text-slate-400 hover:text-slate-200 disabled:opacity-40 text-xs font-bold px-2 py-1 rounded transition"
+              >
+                ✕ Close
+              </button>
+            </div>
+            <p className="text-xs text-slate-400 mb-4 leading-relaxed">
+              Upload monthly equipment workbook (for example: <span className="text-slate-200">Equipment entries March-26.xlsx</span>).
+              Required columns should include Date, Equipment/Name, and Area/Location. Optional: plate, status, hours, activity, rental amount, operator details.
+            </p>
+
+            <div className="flex flex-wrap gap-3 items-end mb-4">
+              <div>
+                <div className={labelCls}>Excel File (.xlsx)</div>
+                <input
+                  ref={equipmentImportFileRef}
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  className="text-xs text-slate-300 max-w-full file:mr-2 file:rounded-lg file:border-0 file:bg-sky-600 file:px-3 file:py-1.5 file:text-xs file:font-bold file:text-white hover:file:bg-sky-500 cursor-pointer"
+                />
+              </div>
+              <FormField label="Sheet Name (optional)">
+                <input
+                  type="text"
+                  className={`${inputCls} w-48`}
+                  placeholder="e.g. March 2026"
+                  value={equipmentImportSheetName}
+                  onChange={(e) => setEquipmentImportSheetName(e.target.value)}
+                />
+              </FormField>
+              <FormField label="Default operator Civil ID (optional)">
+                <input
+                  type="text"
+                  className={`${inputCls} w-52`}
+                  placeholder="Defaults to import operator ID"
+                  value={equipmentImportCivilId}
+                  onChange={(e) => setEquipmentImportCivilId(e.target.value)}
+                />
+              </FormField>
+              <label className="flex items-center gap-2 text-xs text-slate-300 mb-1">
+                <input
+                  type="checkbox"
+                  checked={equipmentImportDryRun}
+                  onChange={(e) => setEquipmentImportDryRun(e.target.checked)}
+                  className="rounded border-white/20 accent-sky-400"
+                />
+                Dry run (validate only, no insert)
+              </label>
+            </div>
+
+            <button
+              type="button"
+              onClick={submitEquipmentImport}
+              disabled={equipmentImporting}
+              className="rounded-xl bg-sky-600 hover:bg-sky-500 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold px-5 py-2.5 transition shadow-lg shadow-sky-900/40"
+            >
+              {equipmentImporting ? "Importing..." : "Run Equipment Import"}
+            </button>
+
+            {equipmentImportResult && (
+              <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/60 p-4">
+                <div className="text-sm font-bold mb-3 text-emerald-300">Equipment Import Complete</div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-3">
+                  {[
+                    { label: "Rows Read", value: equipmentImportResult.rows_read ?? 0, color: "text-slate-200" },
+                    { label: "Equipment Rows", value: equipmentImportResult.equipment_rows ?? 0, color: "text-sky-300" },
+                    { label: "Inserted", value: equipmentImportResult.inserted ?? 0, color: "text-emerald-300" },
+                    { label: "Merged", value: equipmentImportResult.merged ?? 0, color: "text-amber-300" },
+                    { label: "Errors", value: equipmentImportResult.error_count ?? 0, color: "text-rose-300" },
+                  ].map((s) => (
+                    <div key={s.label} className="rounded-lg bg-slate-800/70 border border-white/8 p-3 text-center">
+                      <div className={`text-xl font-black ${s.color}`}>{s.value}</div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">{s.label}</div>
+                    </div>
+                  ))}
+                </div>
+                {!!equipmentImportResult?.errors?.length && (
+                  <details className="mt-2">
+                    <summary className="text-xs font-semibold text-rose-300 cursor-pointer hover:text-rose-200">
+                      Show import errors ({equipmentImportResult.errors.length})
+                    </summary>
+                    <div className="mt-2 max-h-44 overflow-y-auto rounded-lg bg-rose-950/30 border border-rose-400/20 p-2 space-y-1">
+                      {equipmentImportResult.errors.map((e, i) => (
+                        <div key={i} className="text-[11px] text-rose-200 font-mono">
+                          Row {e.row}: {e.error}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+          </CardPanel>
+        )}
 
         {/* ── Add New Equipment ── */}
         {showAddEquipment && (
@@ -1513,13 +2069,23 @@ function EquipmentTab() {
               <h3 className="text-base font-bold text-white">📋 Equipment Master List
                 <span className="ml-2 text-xs text-slate-500 font-normal">({filteredMaster.length} equipment)</span>
               </h3>
-              <input
-                type="text"
-                className={`${inputCls} w-64`}
-                placeholder="Search name, plate, type, location..."
-                value={masterSearch}
-                onChange={(e) => setMasterSearch(e.target.value)}
-              />
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadMasterListExcel}
+                  className="rounded-xl border border-emerald-400/35 hover:border-emerald-400/65 bg-emerald-600/15 hover:bg-emerald-600/25 text-emerald-200 text-xs font-bold px-3 py-2 transition whitespace-nowrap"
+                  title="Download this equipment list as an Excel file (respects location/type filters and search)"
+                >
+                  ↓ Download list (Excel)
+                </button>
+                <input
+                  type="text"
+                  className={`${inputCls} w-64 min-w-[12rem]`}
+                  placeholder="Search name, plate, type, location..."
+                  value={masterSearch}
+                  onChange={(e) => setMasterSearch(e.target.value)}
+                />
+              </div>
             </div>
             <div className="overflow-x-auto scrollbar-thin">
               <table className="w-full min-w-[1100px] text-xs border-collapse">

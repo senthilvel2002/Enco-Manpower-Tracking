@@ -1,9 +1,10 @@
 const explicitBase = process.env.REACT_APP_API_BASE_URL;
 
 /**
- * Production build (e.g. Render): same-origin API — use relative `/api/...`.
- * Local `npm start`: call backend on port 5000.
- * Split deploy: set REACT_APP_API_BASE_URL=https://your-api.onrender.com at build time.
+ * If REACT_APP_API_BASE_URL is set, requests go to that backend.
+ * If not set:
+ * - production uses same-origin `/api/...`
+ * - local dev calls backend on port 5000
  */
 export const API_BASE_URL = (() => {
   if (explicitBase !== undefined && explicitBase !== "") {

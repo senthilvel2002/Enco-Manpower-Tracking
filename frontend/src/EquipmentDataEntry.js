@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { apiUrl } from "./api";
 import LoadingOverlay from "./LoadingOverlay";
 import WorkerAvatar from "./WorkerAvatar";
@@ -53,6 +53,7 @@ function Badge({ children, color = "amber" }) {
 
 function EquipmentDataEntry() {
   const { state } = useLocation();
+  const navigate = useNavigate();
   const [pendingCount, setPendingCount] = useState(0);
   const [submitSuccess, setSubmitSuccess] = useState(false);
   const [submitError, setSubmitError] = useState("");
@@ -315,7 +316,9 @@ function EquipmentDataEntry() {
         rentalAmount: "",
       }));
       setEquipmentList([]);
-      setTimeout(() => setSubmitSuccess(false), 5000);
+      window.setTimeout(() => {
+        navigate("/", { replace: true });
+      }, 600);
     } catch {
       setSubmitError("Unable to submit. Please try again.");
     }

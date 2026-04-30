@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { apiUrl } from "./api";
 import LoadingOverlay from "./LoadingOverlay";
 import WorkerAvatar from "./WorkerAvatar";
@@ -23,6 +23,7 @@ const labelCls = "block text-xs font-semibold uppercase tracking-wider text-slat
 
 function WorkerDataEntry() {
   const { state } = useLocation();
+  const navigate = useNavigate();
   const profileMenuRef = useRef(null);
   const [locations, setLocations] = useState([]);
   const [incharges, setIncharges] = useState([]);
@@ -246,7 +247,9 @@ function WorkerDataEntry() {
         ...p, todayActivity: "", timeFrom: "", timeTo: "",
         location: "", incharge: "", permitIssuer: "", workerShift: "Day", leaveReason: "", itemTag: "",
       }));
-      setTimeout(() => setSubmitSuccess(false), 4000);
+      window.setTimeout(() => {
+        navigate("/", { replace: true });
+      }, 600);
     } catch { alert("Unable to submit now"); }
   };
 

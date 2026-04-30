@@ -131,7 +131,7 @@ function WorkerEntriesTab({ adminName }) {
   };
 
   const COLS = [
-    "Worker", "Designation", "Company", "Location", "Permit Issuer",
+    "Worker", "Work date", "Designation", "Company", "Location", "Permit Issuer",
     "Activity", "Shift", "Leave Reason", "Time (From→To)",
     "Worker Hrs", "Incharge", "Status", "Action",
   ];
@@ -206,6 +206,9 @@ function WorkerEntriesTab({ adminName }) {
                           />
                           <span className="break-words whitespace-normal leading-snug">{entry.worker_name || "-"}</span>
                         </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-200 whitespace-nowrap font-mono text-xs">
+                        {entry.work_date || "-"}
                       </td>
                       <td className="px-4 py-3 text-slate-300">{entry.designation || "-"}</td>
                       <td className="px-4 py-3 text-slate-300 whitespace-nowrap">{entry.company_name || "-"}</td>
